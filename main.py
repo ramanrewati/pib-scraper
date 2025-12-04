@@ -17,7 +17,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
 #
 def random_sleep():
-    time.sleep(random.uniform(0.2, 0.5))
+    time.sleep(random.uniform(0.1, 0.3))
 
 
 # -------------------------
