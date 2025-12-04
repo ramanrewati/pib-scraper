@@ -8,21 +8,46 @@ from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import asyncio
 import html as html_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from crawl4ai.async_webcrawler import AsyncWebCrawler
+
 
 BASE_URL = "https://www.pib.gov.in/allRel.aspx?reg=3&lang=1"
 ROOT = "https://www.pib.gov.in"
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
-#
+
+# -----------------------------------
+# Politeness sleep
+# -----------------------------------
 def random_sleep():
     time.sleep(random.uniform(0.1, 0.3))
 
 
-# -------------------------
-# ASP.NET hidden fields
-# -------------------------
+# -----------------------------------
+# Deduplication of paragraphs
+# -----------------------------------
+def dedupe_paragraphs(text: str) -> str:
+    """
+    Remove duplicate paragraphs while preserving order.
+    Paragraphs split on double newline.
+    """
+    seen = set()
+    cleaned = []
+    for para in text.split("\n\n"):
+        p = para.strip()
+        if not p:
+            continue
+        if p not in seen:
+            seen.add(p)
+            cleaned.append(p)
+    return "\n\n".join(cleaned)
+
+
+# -----------------------------------
+# ASP.NET hidden field extraction
+# -----------------------------------
 def get_viewstate_payload(soup: BeautifulSoup):
     payload = {}
     for inp in soup.find_all("input"):
@@ -30,23 +55,24 @@ def get_viewstate_payload(soup: BeautifulSoup):
         if not name:
             continue
         payload[name] = inp.get("value", "")
+
     for sel in soup.find_all("select"):
         name = sel.get("name")
         if not name:
             continue
         opt = sel.find("option", selected=True)
-        if opt:
-            payload[name] = opt.get("value", "")
-        else:
-            first = sel.find("option")
-            payload[name] = first.get("value", "") if first else ""
+        payload[name] = opt.get("value", "") if opt else sel.find("option").get("value", "")
+
     return payload
 
 
+# -----------------------------------
+# ASP.NET postback: month/year/day
+# -----------------------------------
 def post_for_month(session: requests.Session, month: int, year: int, day: int | None):
-    """Return HTML for listing page with (month, year, day-or-All)."""
     r = session.get(BASE_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
     payload = get_viewstate_payload(soup)
 
@@ -54,8 +80,9 @@ def post_for_month(session: requests.Session, month: int, year: int, day: int | 
     payload["ctl00$ContentPlaceHolder1$ddlMonth"] = str(month)
     payload["ctl00$ContentPlaceHolder1$ddlYear"] = str(year)
 
-    # event target depends on whether day was changed
-    payload["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$ddlMonth" if day is None else "ctl00$ContentPlaceHolder1$ddlday"
+    payload["__EVENTTARGET"] = (
+        "ctl00$ContentPlaceHolder1$ddlMonth" if day is None else "ctl00$ContentPlaceHolder1$ddlday"
+    )
     payload["__EVENTARGUMENT"] = ""
 
     random_sleep()
@@ -64,26 +91,37 @@ def post_for_month(session: requests.Session, month: int, year: int, day: int | 
     return r2.text
 
 
+# -----------------------------------
+# Extract all release PRID links
+# -----------------------------------
 def extract_release_links(listing_html: str):
     soup = BeautifulSoup(listing_html, "html.parser")
     links = []
+
     for a in soup.select("a[href*='PressReleasePage.aspx']"):
         href = a.get("href")
         if not href:
             continue
+
         if href.startswith("/"):
             full = ROOT + href
         elif href.startswith("http"):
             full = href
         else:
             full = ROOT + "/" + href
+
         if full not in links:
             links.append(full)
+
     return links
 
 
+# -----------------------------------
+# Extract Hindi PRID link
+# -----------------------------------
 def find_hindi_link_from_release_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
+
     block = soup.find("div", class_="ReleaseLang")
     if block:
         for a in block.find_all("a"):
@@ -91,67 +129,62 @@ def find_hindi_link_from_release_html(html: str):
             if "हिन्दी" in txt or "हिंदी" in txt or txt.lower() == "hindi":
                 href = a.get("href")
                 if not href:
-                    continue
+                    return None
                 if href.startswith("/"):
                     return ROOT + href
                 if href.startswith("http"):
                     return href
                 return ROOT + "/" + href
-    # fallback search anywhere
+
     a = soup.find("a", string=lambda t: t and ("हिन्दी" in t or "हिंदी" in t or t.strip().lower() == "hindi"))
     if a:
         href = a.get("href")
-        if href:
-            if href.startswith("/"): return ROOT + href
-            if href.startswith("http"): return href
-            return ROOT + "/" + href
+        if href.startswith("/"):
+            return ROOT + href
+        if href.startswith("http"):
+            return href
+        return ROOT + "/" + href
+
     return None
 
 
-# -------------------------
+# -----------------------------------
 # BeautifulSoup fallback cleaner
-# -------------------------
+# -----------------------------------
 def bs_extract_text_from_release_html(html: str) -> str:
-    """
-    Fallback extractor: check hidden field ltrDescriptionn, PdfDiv, main content p tags, or aggregate <p>.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) Check hidden input ltrDescriptionn (contains HTML-escaped content)
     hidden = soup.find("input", {"id": "ltrDescriptionn"})
     if hidden and hidden.get("value"):
         raw = hidden.get("value")
-        # it's HTML-escaped, so unescape and strip tags
         unescaped = html_module.unescape(raw)
         txt_soup = BeautifulSoup(unescaped, "html.parser")
-        texts = [t.get_text(separator=" ", strip=True) for t in txt_soup.find_all(["p", "div", "span"])]
+        texts = [
+            t.get_text(separator=" ", strip=True)
+            for t in txt_soup.find_all(["p", "div", "span"])
+        ]
         joined = "\n\n".join([t for t in texts if t])
         if joined.strip():
             return joined.strip()
 
-    # 2) PdfDiv (often contains the printable content)
     pdfdiv = soup.find(id="PdfDiv")
     if pdfdiv:
         txt = pdfdiv.get_text(separator="\n", strip=True)
         if txt.strip():
             return txt.strip()
 
-    # 3) main content area - many pages have .innner-page-main-about-us-content-right-part
     main = soup.find(class_="innner-page-main-about-us-content-right-part")
     if main:
-        # collect p tags
         ps = main.find_all("p")
         if ps:
             texts = [p.get_text(separator=" ", strip=True) for p in ps]
             joined = "\n\n".join([t for t in texts if t])
             if joined.strip():
                 return joined.strip()
-        # else fallback to all text
         txt = main.get_text(separator="\n", strip=True)
         if txt.strip():
             return txt.strip()
 
-    # 4) Generic fallback - join all <p> on page
     ps = soup.find_all("p")
     if ps:
         texts = [p.get_text(separator=" ", strip=True) for p in ps]
@@ -159,101 +192,64 @@ def bs_extract_text_from_release_html(html: str) -> str:
         if joined.strip():
             return joined.strip()
 
-    # 5) final fallback - body text
     body = soup.body
     if body:
-        txt = body.get_text(separator="\n", strip=True)
-        return txt.strip()
+        return body.get_text(separator="\n", strip=True)
 
     return ""
 
 
-# -------------------------
-# crawl4ai on raw HTML (AsyncWebCrawler)
-# -------------------------
+# -----------------------------------
+# crawl4ai cleaning for raw HTML
+# -----------------------------------
 def clean_html_with_asynccrawler(html: str) -> str:
-    """
-    Try to run AsyncWebCrawler on the provided raw HTML.
-    Use arun(html=...) if available; otherwise try arun with a data: URL fallback.
-    """
-    async def fetch_using_html():
+    async def fetch_html():
         crawler = AsyncWebCrawler()
-        # try likely parameter name 'html' or 'source' — prefer html
         try:
-            # common API: arun(html=...)
             res = await crawler.arun(html=html)
             return getattr(res, "markdown", None) or getattr(res, "text", None) or ""
         except TypeError:
-            # try alternative call signature if arun doesn't accept 'html'
             try:
-                res = await crawler.arun(document=html)  # some libs use 'document'
+                res = await crawler.arun(document=html)
                 return getattr(res, "markdown", None) or getattr(res, "text", None) or ""
-            except Exception:
-                # fallback to making a tiny in-memory data URL (less ideal but sometimes works)
-                try:
-                    # create data URL (may or may not be accepted by crawler)
-                    data_url = "data:text/html;charset=utf-8," + requests.utils.requote_uri(html[:100000])
-                    res = await crawler.arun(data_url)
-                    return getattr(res, "markdown", None) or getattr(res, "text", None) or ""
-                except Exception:
-                    raise
+            except:
+                return ""
 
     try:
-        return asyncio.run(fetch_using_html())
-    except Exception:
-        # any failure reported to caller; return empty to trigger BS fallback
+        return asyncio.run(fetch_html())
+    except:
         return ""
 
 
-# -------------------------
-# worker: cleans HTML pair (eng_html, hin_html)
-# -------------------------
+# -----------------------------------
+# Worker: clean HTML -> text
+# -----------------------------------
 def worker_clean_html(pair):
-    """
-    pair: (eng_html, hin_html)
-    returns (eng_text, hin_text) or None
-    """
     eng_html, hin_html = pair
 
-    # politeness per worker
     random_sleep()
 
-    # Try crawl4ai on English HTML
-    eng_text = ""
-    try:
-        eng_text = clean_html_with_asynccrawler(eng_html)
-    except Exception:
-        eng_text = ""
-
-    # Fallback if empty
-    if not eng_text:
-        eng_text = bs_extract_text_from_release_html(eng_html)
-
+    eng_text = clean_html_with_asynccrawler(eng_html) or bs_extract_text_from_release_html(eng_html)
     if not eng_text:
         return None
+    eng_text = dedupe_paragraphs(eng_text)
 
     random_sleep()
 
-    hin_text = ""
-    try:
-        hin_text = clean_html_with_asynccrawler(hin_html)
-    except Exception:
-        hin_text = ""
-
-    if not hin_text:
-        hin_text = bs_extract_text_from_release_html(hin_html)
-
+    hin_text = clean_html_with_asynccrawler(hin_html) or bs_extract_text_from_release_html(hin_html)
     if not hin_text:
         return None
+    hin_text = dedupe_paragraphs(hin_text)
 
     return (eng_text, hin_text)
 
 
-# -------------------------
-# Main orchestration
-# -------------------------
+# -----------------------------------
+# MAIN LOOP
+# -----------------------------------
 def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int | None,
                               output_csv="pib_bilingual.csv", workers=None):
+
     if workers is None:
         workers = max(2, cpu_count() // 2)
 
@@ -273,40 +269,54 @@ def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int 
         writer = csv.writer(fh, quoting=csv.QUOTE_ALL)
         writer.writerow(["English", "Hindi"])
 
-        while (cur_year < today.year) or (cur_year == today.year and cur_month <= today.month):
-            print(f"\n=== Month {cur_month:02d}-{cur_year}, Day={start_day if start_day else 'ALL'} ===")
+        while cur_year < today.year or (cur_year == today.year and cur_month <= today.month):
+            print(f"\n=== Month {cur_month:02d}-{cur_year}, Day={start_day or 'ALL'} ===")
+
             try:
                 listing_html = post_for_month(sess, cur_month, cur_year, start_day)
                 links = extract_release_links(listing_html)
                 print("Found releases:", len(links))
 
-                # Build raw-HTML candidate pairs (main process fetches both pages)
+                # ------------------------ PARALLEL FETCH ------------------------
                 candidate_html_pairs = []
-                for link in tqdm(links, desc="Checking releases", leave=False, ncols=80):
+
+                def fetch_pair(link):
                     try:
-                        random_sleep()
                         r_en = sess.get(link, headers=HEADERS, timeout=30)
                         r_en.raise_for_status()
                         hindi_url = find_hindi_link_from_release_html(r_en.text)
                         if not hindi_url:
-                            continue
-                        # fetch hindi HTML using same session (preserves cookies)
-                        random_sleep()
+                            return None
                         r_hi = sess.get(hindi_url, headers=HEADERS, timeout=30)
                         r_hi.raise_for_status()
-                        candidate_html_pairs.append((r_en.text, r_hi.text))
-                    except Exception:
-                        continue
+                        return (r_en.text, r_hi.text)
+                    except:
+                        return None
+
+                with ThreadPoolExecutor(max_workers=32) as executor:
+                    futures = {executor.submit(fetch_pair, link): link for link in links}
+                    for future in tqdm(
+                        as_completed(futures),
+                        total=len(links),
+                        desc="Fetching EN+HI in parallel",
+                        ncols=80,
+                        leave=False,
+                    ):
+                        res = future.result()
+                        if res:
+                            candidate_html_pairs.append(res)
+                # -----------------------------------------------------------------
 
                 print("Pairs queued for cleaning:", len(candidate_html_pairs))
 
-                # Parallel cleaning (workers only process raw HTML; no requests to PIB)
                 if candidate_html_pairs:
                     with Pool(workers) as p:
-                        for res in tqdm(p.imap_unordered(worker_clean_html, candidate_html_pairs),
-                                        total=len(candidate_html_pairs),
-                                        desc="Cleaning",
-                                        ncols=80):
+                        for res in tqdm(
+                            p.imap_unordered(worker_clean_html, candidate_html_pairs),
+                            total=len(candidate_html_pairs),
+                            desc="Cleaning",
+                            ncols=80,
+                        ):
                             if res:
                                 writer.writerow(list(res))
                                 saved_pairs += 1
@@ -316,7 +326,7 @@ def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int 
             except Exception as e:
                 print("Month-level error:", e)
 
-            # advance month
+            # move to next month
             if cur_month == 12:
                 cur_month = 1
                 cur_year += 1
@@ -331,14 +341,13 @@ def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int 
     print("Output CSV:", output_csv)
 
 
-# -------------------------
+# -----------------------------------
 # Run
-# -------------------------
+# -----------------------------------
 if __name__ == "__main__":
-    # tuning
     START_YEAR = 2025
     START_MONTH = 12
-    START_DAY = 4   # None for "All"
+    START_DAY = 4    # None for ALL
     WORKERS = 24
 
     iterate_by_month_parallel(
