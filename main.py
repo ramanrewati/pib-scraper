@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import datetime
 import time
 import random
-import csv
+import json
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import asyncio
@@ -18,21 +18,11 @@ ROOT = "https://www.pib.gov.in"
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
 
-# -----------------------------------
-# Politeness sleep
-# -----------------------------------
 def random_sleep():
     time.sleep(random.uniform(0.1, 0.3))
 
 
-# -----------------------------------
-# Deduplication of paragraphs
-# -----------------------------------
 def dedupe_paragraphs(text: str) -> str:
-    """
-    Remove duplicate paragraphs while preserving order.
-    Paragraphs split on double newline.
-    """
     seen = set()
     cleaned = []
     for para in text.split("\n\n"):
@@ -45,34 +35,23 @@ def dedupe_paragraphs(text: str) -> str:
     return "\n\n".join(cleaned)
 
 
-# -----------------------------------
-# ASP.NET hidden field extraction
-# -----------------------------------
 def get_viewstate_payload(soup: BeautifulSoup):
     payload = {}
     for inp in soup.find_all("input"):
         name = inp.get("name")
-        if not name:
-            continue
-        payload[name] = inp.get("value", "")
-
+        if name:
+            payload[name] = inp.get("value", "")
     for sel in soup.find_all("select"):
         name = sel.get("name")
-        if not name:
-            continue
-        opt = sel.find("option", selected=True)
-        payload[name] = opt.get("value", "") if opt else sel.find("option").get("value", "")
-
+        if name:
+            opt = sel.find("option", selected=True)
+            payload[name] = opt.get("value", "") if opt else sel.find("option").get("value", "")
     return payload
 
 
-# -----------------------------------
-# ASP.NET postback: month/year/day
-# -----------------------------------
-def post_for_month(session: requests.Session, month: int, year: int, day: int | None):
+def post_for_month(session, month, year, day):
     r = session.get(BASE_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
-
     soup = BeautifulSoup(r.text, "html.parser")
     payload = get_viewstate_payload(soup)
 
@@ -91,35 +70,25 @@ def post_for_month(session: requests.Session, month: int, year: int, day: int | 
     return r2.text
 
 
-# -----------------------------------
-# Extract all release PRID links
-# -----------------------------------
-def extract_release_links(listing_html: str):
+def extract_release_links(listing_html):
     soup = BeautifulSoup(listing_html, "html.parser")
     links = []
-
     for a in soup.select("a[href*='PressReleasePage.aspx']"):
         href = a.get("href")
         if not href:
             continue
-
         if href.startswith("/"):
             full = ROOT + href
         elif href.startswith("http"):
             full = href
         else:
             full = ROOT + "/" + href
-
         if full not in links:
             links.append(full)
-
     return links
 
 
-# -----------------------------------
-# Extract Hindi PRID link
-# -----------------------------------
-def find_hindi_link_from_release_html(html: str):
+def find_hindi_link_from_release_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
     block = soup.find("div", class_="ReleaseLang")
@@ -128,8 +97,6 @@ def find_hindi_link_from_release_html(html: str):
             txt = (a.get_text() or "").strip()
             if "हिन्दी" in txt or "हिंदी" in txt or txt.lower() == "hindi":
                 href = a.get("href")
-                if not href:
-                    return None
                 if href.startswith("/"):
                     return ROOT + href
                 if href.startswith("http"):
@@ -148,9 +115,6 @@ def find_hindi_link_from_release_html(html: str):
     return None
 
 
-# -----------------------------------
-# BeautifulSoup fallback cleaner
-# -----------------------------------
 def bs_extract_text_from_release_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -159,10 +123,7 @@ def bs_extract_text_from_release_html(html: str) -> str:
         raw = hidden.get("value")
         unescaped = html_module.unescape(raw)
         txt_soup = BeautifulSoup(unescaped, "html.parser")
-        texts = [
-            t.get_text(separator=" ", strip=True)
-            for t in txt_soup.find_all(["p", "div", "span"])
-        ]
+        texts = [t.get_text(separator=" ", strip=True) for t in txt_soup.find_all(["p", "div", "span"])]
         joined = "\n\n".join([t for t in texts if t])
         if joined.strip():
             return joined.strip()
@@ -181,6 +142,7 @@ def bs_extract_text_from_release_html(html: str) -> str:
             joined = "\n\n".join([t for t in texts if t])
             if joined.strip():
                 return joined.strip()
+
         txt = main.get_text(separator="\n", strip=True)
         if txt.strip():
             return txt.strip()
@@ -199,21 +161,14 @@ def bs_extract_text_from_release_html(html: str) -> str:
     return ""
 
 
-# -----------------------------------
-# crawl4ai cleaning for raw HTML
-# -----------------------------------
 def clean_html_with_asynccrawler(html: str) -> str:
     async def fetch_html():
         crawler = AsyncWebCrawler()
         try:
             res = await crawler.arun(html=html)
             return getattr(res, "markdown", None) or getattr(res, "text", None) or ""
-        except TypeError:
-            try:
-                res = await crawler.arun(document=html)
-                return getattr(res, "markdown", None) or getattr(res, "text", None) or ""
-            except:
-                return ""
+        except:
+            return ""
 
     try:
         return asyncio.run(fetch_html())
@@ -221,9 +176,6 @@ def clean_html_with_asynccrawler(html: str) -> str:
         return ""
 
 
-# -----------------------------------
-# Worker: clean HTML -> text
-# -----------------------------------
 def worker_clean_html(pair):
     eng_html, hin_html = pair
 
@@ -245,10 +197,11 @@ def worker_clean_html(pair):
 
 
 # -----------------------------------
-# MAIN LOOP
+# Main Loop
 # -----------------------------------
-def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int | None,
-                              output_csv="pib_bilingual.csv", workers=None):
+def iterate_by_month_parallel(start_year, start_month, start_day,
+                              output_jsonl="pib_bilingual.jsonl",
+                              workers=None):
 
     if workers is None:
         workers = max(2, cpu_count() // 2)
@@ -260,85 +213,78 @@ def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int 
     sess = requests.Session()
     sess.headers.update(HEADERS)
 
+    jsonl_file = open(output_jsonl, "w", encoding="utf-8")
+
     total_months = (today.year - start_year) * 12 + (today.month - start_month) + 1
     month_bar = tqdm(total=total_months, desc="Months", ncols=80)
 
     saved_pairs = 0
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh, quoting=csv.QUOTE_ALL)
-        writer.writerow(["English", "Hindi"])
+    while cur_year < today.year or (cur_year == today.year and cur_month <= today.month):
+        print(f"\n=== Month {cur_month:02d}-{cur_year}, Day={start_day or 'ALL'} ===")
 
-        while cur_year < today.year or (cur_year == today.year and cur_month <= today.month):
-            print(f"\n=== Month {cur_month:02d}-{cur_year}, Day={start_day or 'ALL'} ===")
+        try:
+            listing_html = post_for_month(sess, cur_month, cur_year, start_day)
+            links = extract_release_links(listing_html)
+            print("Found releases:", len(links))
 
-            try:
-                listing_html = post_for_month(sess, cur_month, cur_year, start_day)
-                links = extract_release_links(listing_html)
-                print("Found releases:", len(links))
+            candidate_html_pairs = []
 
-                # ------------------------ PARALLEL FETCH ------------------------
-                candidate_html_pairs = []
-
-                def fetch_pair(link):
-                    try:
-                        r_en = sess.get(link, headers=HEADERS, timeout=30)
-                        r_en.raise_for_status()
-                        hindi_url = find_hindi_link_from_release_html(r_en.text)
-                        if not hindi_url:
-                            return None
-                        r_hi = sess.get(hindi_url, headers=HEADERS, timeout=30)
-                        r_hi.raise_for_status()
-                        return (r_en.text, r_hi.text)
-                    except:
+            def fetch_pair(link):
+                try:
+                    r_en = sess.get(link, headers=HEADERS, timeout=30)
+                    r_en.raise_for_status()
+                    hindi_url = find_hindi_link_from_release_html(r_en.text)
+                    if not hindi_url:
                         return None
+                    r_hi = sess.get(hindi_url, headers=HEADERS, timeout=30)
+                    r_hi.raise_for_status()
+                    return (r_en.text, r_hi.text)
+                except:
+                    return None
 
-                with ThreadPoolExecutor(max_workers=32) as executor:
-                    futures = {executor.submit(fetch_pair, link): link for link in links}
-                    for future in tqdm(
-                        as_completed(futures),
-                        total=len(links),
-                        desc="Fetching EN+HI in parallel",
-                        ncols=80,
-                        leave=False,
-                    ):
-                        res = future.result()
+            with ThreadPoolExecutor(max_workers=32) as executor:
+                futures = {executor.submit(fetch_pair, link): link for link in links}
+                for future in tqdm(as_completed(futures), total=len(links),
+                                   desc="Fetching EN+HI in parallel", ncols=80):
+                    res = future.result()
+                    if res:
+                        candidate_html_pairs.append(res)
+
+            print("Pairs queued for cleaning:", len(candidate_html_pairs))
+
+            if candidate_html_pairs:
+                with Pool(workers) as p:
+                    for res in tqdm(p.imap_unordered(worker_clean_html, candidate_html_pairs),
+                                    total=len(candidate_html_pairs),
+                                    desc="Cleaning", ncols=80):
                         if res:
-                            candidate_html_pairs.append(res)
-                # -----------------------------------------------------------------
+                            english, hindi = res
+                            jsonl_file.write(json.dumps({"english": english,
+                                                         "hindi": hindi},
+                                                         ensure_ascii=False) + "\n")
+                            saved_pairs += 1
 
-                print("Pairs queued for cleaning:", len(candidate_html_pairs))
+            print("Saved so far:", saved_pairs)
 
-                if candidate_html_pairs:
-                    with Pool(workers) as p:
-                        for res in tqdm(
-                            p.imap_unordered(worker_clean_html, candidate_html_pairs),
-                            total=len(candidate_html_pairs),
-                            desc="Cleaning",
-                            ncols=80,
-                        ):
-                            if res:
-                                writer.writerow(list(res))
-                                saved_pairs += 1
+        except Exception as e:
+            print("Month error:", e)
 
-                print("Saved so far:", saved_pairs)
+        if cur_month == 12:
+            cur_month = 1
+            cur_year += 1
+        else:
+            cur_month += 1
 
-            except Exception as e:
-                print("Month-level error:", e)
+        month_bar.update(1)
 
-            # move to next month
-            if cur_month == 12:
-                cur_month = 1
-                cur_year += 1
-            else:
-                cur_month += 1
-
-            month_bar.update(1)
-
+    jsonl_file.close()
     month_bar.close()
+
     print("\n=== DONE ===")
     print("Total bilingual entries:", saved_pairs)
-    print("Output CSV:", output_csv)
+    print("Output JSONL:", output_jsonl)
+
 
 
 # -----------------------------------
@@ -347,13 +293,13 @@ def iterate_by_month_parallel(start_year: int, start_month: int, start_day: int 
 if __name__ == "__main__":
     START_YEAR = 2025
     START_MONTH = 12
-    START_DAY = 4    # None for ALL
+    START_DAY = 5
     WORKERS = 24
 
     iterate_by_month_parallel(
         START_YEAR,
-        START_MONTH,
+        START_MONTH, 
         START_DAY,
-        output_csv="pib_bilingual.csv",
+        output_jsonl="pib_bilingual.jsonl",
         workers=WORKERS
     )
